@@ -781,6 +781,246 @@ def _(mo, np, params, sim):
 
 
 @app.cell
+def _(
+    baseline_shift,
+    bad_channels,
+    drift,
+    mayer,
+    mo,
+    motion_spikes,
+    poor_coupling,
+    pulse,
+    respiration,
+    superficial,
+    wavelength_imbalance,
+    white_noise,
+):
+    # Live readout: the moment you raise a slider, this says what to expect and where.
+    _eff = [
+        ("white detector noise", white_noise.value, "fuzzier traces; spectral noise floor up; more channels prune"),
+        ("low-frequency drift", drift.value, "slow band wander; low-frequency power up"),
+        ("pulse", pulse.value, "stronger ~1 Hz ripple; cardiac spectral peak grows"),
+        ("respiration", respiration.value, "stronger ~0.25 Hz wave; respiration peak grows"),
+        ("Mayer", mayer.value, "stronger ~0.1 Hz oscillation; Mayer peak grows"),
+        ("shared superficial physiology", superficial.value, "scalp signal up; short channels show a fake response; long channels contaminated"),
+        ("motion spikes", motion_spikes.value, "GVTD spikes over threshold; grayplot vertical stripes"),
+        ("baseline shifts", baseline_shift.value, "step changes; a GVTD spike each; grayplot brightness steps"),
+        ("bad channels", bad_channels.value, "more flatline / saturated / noise-floor channels prune"),
+        ("poor coupling", poor_coupling.value, "more channels fall to the noise floor and prune"),
+        ("wavelength imbalance", wavelength_imbalance.value, "850 nm light/SNR drops; HbO/HbR degrades"),
+    ]
+    _active = [(n, v, e) for n, v, e in _eff if v > 0]
+    if _active:
+        _body = "**You added (watch the named plots update):**\n\n" + "\n".join(
+            f"- **{n} +{v:.1f}** -> {e}" for n, v, e in _active
+        )
+        _kind = "info"
+    else:
+        _body = (
+            "_Pure preset - no extra sliders added. Raise a slider in the sidebar, or "
+            "use the **single-artifact explorer** just below to see each effect in isolation._"
+        )
+        _kind = "neutral"
+    mo.callout(mo.md(_body), kind=_kind)
+    return
+
+
+@app.cell
+def _(mo):
+    # (param_key, max_value, diagnostic, expected effect, where to watch in the full app)
+    ARTIFACT_SPEC = {
+        "White detector noise": ("white_noise", 3.0, "trace", "the trace turns fuzzy and the spectral noise floor lifts; channels cross the 7.5% std gate and prune.", "Raw light + QC-metrics std histogram"),
+        "Low-frequency drift": ("drift", 3.0, "trace", "the trace slowly wanders up and down; low-frequency power balloons.", "OD traces + spectrum"),
+        "Pulse (~1 Hz)": ("pulse", 3.0, "trace", "a ~1 Hz oscillation rides on the trace; the cardiac spectral peak grows.", "Zoomed pulse + spectrum"),
+        "Respiration (~0.25 Hz)": ("respiration", 3.0, "trace", "a ~0.25 Hz wave appears; the respiration spectral peak grows.", "Spectrum"),
+        "Mayer waves (~0.1 Hz)": ("mayer", 3.0, "trace", "a slow ~0.1 Hz oscillation appears; the Mayer spectral peak grows.", "Spectrum"),
+        "Shared superficial physiology": ("superficial", 3.0, "hbo", "short channels grow a big 'fake' HbO bump (scalp) and long channels get contaminated.", "HbO/HbR + preprocessing effect"),
+        "Motion spikes": ("motion_spikes", 4.0, "gvtd", "sharp transients hit many channels together; GVTD spikes over threshold.", "GVTD + grayplot"),
+        "Baseline shifts": ("baseline_shift", 3.0, "trace", "the trace steps to a new level after a 'cap movement' and stays there.", "OD traces + grayplot"),
+        "Bad channels": ("bad_channels", 0.4, "rawlight", "more channels flatline / saturate / sit at the noise floor and get pruned.", "Raw light + cap coverage"),
+        "Poor coupling": ("poor_coupling", 0.4, "rawlight", "more channels drop toward the noise floor (low light, high variance) and prune.", "Raw light + cap coverage"),
+        "Wavelength imbalance": ("wavelength_imbalance", 3.0, "falloff", "850 nm loses light/SNR relative to 750 nm, so HbO/HbR (which needs both) degrades.", "Fall-off + HbO/HbR"),
+    }
+    artifact = mo.ui.dropdown(
+        options=list(ARTIFACT_SPEC.keys()),
+        value="Motion spikes",
+        label="Isolate one artifact",
+    )
+    mo.vstack(
+        [
+            mo.md(
+                "## Single-artifact explorer\n"
+                "See one artifact's effect *in isolation*: a **clean baseline (blue)** vs the "
+                "same run with **only that artifact at maximum (red)**. Pick one:"
+            ),
+            artifact,
+        ]
+    )
+    return ARTIFACT_SPEC, artifact
+
+
+@app.cell
+def _(ARTIFACT_SPEC, artifact, mo, np, plt, power_spectrum, process_run, simulate_dot):
+    _key, _maxv, _diag, _expect, _watch = ARTIFACT_SPEC[artifact.value]
+    _base = dict(
+        seed=11, white_noise=0.6, drift=0.1, pulse=0.6, respiration=0.2, mayer=0.2,
+        superficial=0.3, motion_spikes=0.0, baseline_shift=0.0, bad_channels=0.0,
+        poor_coupling=0.0, wavelength_imbalance=0.0,
+    )
+    _on = dict(_base)
+    _on[_key] = _maxv
+    _s0 = simulate_dot(_base)
+    _s1 = simulate_dot(_on)
+
+    def _mid_idx(s):
+        _c = np.where((s["wl"] == 850) & (s["group"] == "mid 20-30 mm") & s["good"])[0]
+        return int(_c[0]) if _c.size else int(np.where(s["wl"] == 850)[0][0])
+
+    def _blk_hbo(pr, s, group):
+        _fs = s["fs"]
+        _rel = np.arange(-5, 30, 1 / _fs)
+        _m = (s["group"][: s["n_pair"]] == group) & pr["good_pair"]
+        _segs = []
+        for _o in s["onsets"]:
+            _a = int((_o - 5) * _fs)
+            _b = _a + _rel.size
+            if _a < 0 or _b > pr["dHbO"].shape[1]:
+                continue
+            _seg = pr["dHbO"][_m, _a:_b]
+            if _seg.size:
+                _segs.append(_seg - _seg[:, _rel < 0].mean(1, keepdims=True))
+        if not _segs:
+            return _rel, np.zeros_like(_rel)
+        return _rel, 1e6 * np.stack(_segs, 0).mean(0).mean(0)
+
+    if _diag == "trace":
+        _i = _mid_idx(_s0)
+        _fig, _ax = plt.subplots(1, 2, figsize=(13, 3.6))
+        _ax[0].plot(_s0["t"], _s0["od"][_i], color="tab:blue", lw=0.7, label="clean")
+        _ax[0].plot(_s1["t"], _s1["od"][_i], color="firebrick", lw=0.7, alpha=0.8, label="artifact")
+        _ax[0].set_title("One mid channel - Delta OD (full run)")
+        _ax[0].set_xlabel("Time (s)")
+        _ax[0].set_ylabel("Delta OD")
+        _ax[0].legend(fontsize=8)
+        # both spectra normalised by the SAME reference (clean max) so the artifact
+        # peak visibly rises above clean instead of each being self-normalised
+        _y0 = _s0["od"][_i] - _s0["od"][_i].mean()
+        _y1 = _s1["od"][_i] - _s1["od"][_i].mean()
+        _ffq = np.fft.rfftfreq(_y0.size, d=1 / _s0["fs"])
+        _p0 = np.abs(np.fft.rfft(_y0)) ** 2
+        _p1 = np.abs(np.fft.rfft(_y1)) ** 2
+        _nrm = _p0.max() + 1e-30
+        _ax[1].loglog(_ffq[1:], _p0[1:] / _nrm, color="tab:blue", label="clean")
+        _ax[1].loglog(_ffq[1:], _p1[1:] / _nrm, color="firebrick", alpha=0.8, label="artifact")
+        for _fq in (0.1, 0.27, 1.05):
+            _ax[1].axvline(_fq, color="0.5", ls="--", lw=0.7)
+        _ax[1].set_xlim(1e-3, 3)
+        _ax[1].set_title("Same channel - power spectrum")
+        _ax[1].set_xlabel("Frequency (Hz)")
+        _ax[1].set_ylabel("Normalized power")
+        _ax[1].legend(fontsize=8)
+    elif _diag == "gvtd":
+        _fig, _ax = plt.subplots(figsize=(13, 3.2))
+        _ax.plot(_s0["t"], _s0["gvtd"], color="tab:blue", lw=1.0, label="clean")
+        _ax.plot(_s1["t"], _s1["gvtd"], color="firebrick", lw=1.0, alpha=0.8, label="artifact")
+        _ax.axhline(_s1["gvtd_threshold"], color="black", ls="--", lw=1.0, label="threshold")
+        _ax.set_title("GVTD - clean vs artifact")
+        _ax.set_xlabel("Time (s)")
+        _ax.set_ylabel("GVTD")
+        _ax.legend(fontsize=8)
+    elif _diag == "hbo":
+        _pr0 = process_run(_s0, False, False)
+        _pr1 = process_run(_s1, False, False)
+        _pr1r = process_run(_s1, False, True)   # artifact + NN1 regression
+        _fig, _ax = plt.subplots(1, 2, figsize=(13, 3.6), sharey=True)
+        for _col, (_g, _ttl) in enumerate([("short <20 mm", "short (scalp)"), ("long 30-40 mm", "long (cortex)")]):
+            _r0, _h0 = _blk_hbo(_pr0, _s0, _g)
+            _r1, _h1 = _blk_hbo(_pr1, _s1, _g)
+            _rr, _hr = _blk_hbo(_pr1r, _s1, _g)
+            _ax[_col].plot(_r0, _h0, color="tab:blue", lw=2, label="clean HbO")
+            _ax[_col].plot(_r1, _h1, color="firebrick", lw=2, alpha=0.85, label="artifact HbO")
+            _ax[_col].plot(_rr, _hr, color="seagreen", lw=2, ls="--", alpha=0.9, label="artifact + NN1 regression")
+            _ax[_col].axvspan(0, 20, color="tab:green", alpha=0.08)
+            _ax[_col].axhline(0, color="0.6", lw=0.5)
+            _ax[_col].set_title(_ttl)
+            _ax[_col].set_xlabel("s from onset")
+        _ax[0].set_ylabel("Delta HbO (uM)")
+        _ax[0].legend(fontsize=7)
+    elif _diag == "rawlight":
+        _fig, _ax = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+        for _col, (_s, _ttl) in enumerate([(_s0, "clean"), (_s1, "artifact")]):
+            _idx = np.where(_s["wl"] == 850)[0]
+            _cm = plt.cm.turbo(np.linspace(0, 1, max(_idx.size, 1)))
+            for _k, _ii in enumerate(_idx):
+                _ax[_col].plot(_s["t"], _s["raw"][_ii], lw=0.3, alpha=0.6, color=_cm[_k])
+            _ax[_col].set_yscale("log")
+            _ax[_col].set_xlabel("Time (s)")
+            _n_kept = int(np.sum((_s["wl"] == 850) & _s["good"]))
+            _ax[_col].set_title(f"850 nm - {_ttl} ({_n_kept} kept)")
+        _ax[0].set_ylabel("Intensity")
+    else:
+        _fig, _ax = plt.subplots(1, 2, figsize=(13, 4), sharey=True)
+        for _col, (_s, _ttl) in enumerate([(_s0, "clean"), (_s1, "artifact")]):
+            for _wl, _c in [(750, "tab:blue"), (850, "tab:orange")]:
+                _m = (_s["wl"] == _wl) & _s["good"]
+                _ax[_col].scatter(_s["rsd"][_m], _s["mean_light"][_m], s=10, alpha=0.6, color=_c, label=f"{_wl} nm")
+            _ax[_col].set_yscale("log")
+            _ax[_col].set_xlabel("Separation (mm)")
+            _ax[_col].set_title(f"Light fall-off - {_ttl}")
+            _ax[_col].legend(fontsize=7)
+        _ax[0].set_ylabel("Mean light")
+
+    _fig.suptitle(f"Single-artifact explorer: {artifact.value}   (blue = clean baseline, red = artifact at max)")
+    _fig.tight_layout()
+
+    # effect-strength meter: quantify the change from a clean baseline -> artifact max
+    def _kept(s):
+        return int(s["good"].sum())
+
+    def _highg(s):
+        return int(np.sum(s["gvtd"] > s["gvtd_threshold"]))
+
+    def _peak(s, fq):
+        _msel = (s["wl"] == 850) & s["good"]
+        if not _msel.any():
+            return 0.0
+        _ff, _pp = power_spectrum(s["od"][_msel].mean(0), s["fs"])
+        _bnd = (_ff >= fq * 0.85) & (_ff <= fq * 1.15)
+        return float(_pp[_bnd].max()) if _bnd.any() else 0.0
+
+    if _key in ("bad_channels", "poor_coupling"):
+        _meter = f"channels kept {_kept(_s0)} -> {_kept(_s1)} (lost {_kept(_s0) - _kept(_s1)})"
+    elif _key == "white_noise":
+        _meter = f"kept {_kept(_s0)} -> {_kept(_s1)}; median temporal std {100 * np.median(_s0['std_od']):.1f}% -> {100 * np.median(_s1['std_od']):.1f}%"
+    elif _key == "drift":
+        _meter = f"median temporal std {100 * np.median(_s0['std_od']):.1f}% -> {100 * np.median(_s1['std_od']):.1f}%"
+    elif _key in ("motion_spikes", "baseline_shift"):
+        _meter = f"high-GVTD (motion) frames {_highg(_s0)} -> {_highg(_s1)}"
+    elif _key in ("pulse", "respiration", "mayer"):
+        _fqm = {"pulse": 1.05, "respiration": 0.27, "mayer": 0.095}[_key]
+        _meter = f"{_key} spectral peak x{_peak(_s1, _fqm) / (_peak(_s0, _fqm) + 1e-12):.0f} larger"
+    elif _key == "wavelength_imbalance":
+        _g0 = (_s0["wl"] == 850) & _s0["good"]
+        _g1 = (_s1["wl"] == 850) & _s1["good"]
+        _l0 = float(np.median(_s0["mean_light"][_g0])) if _g0.any() else 0.0
+        _l1 = float(np.median(_s1["mean_light"][_g1])) if _g1.any() else 0.0
+        _meter = f"850 nm median light {_l0:.1e} -> {_l1:.1e}; channels kept {_kept(_s0)} -> {_kept(_s1)}"
+    else:  # superficial
+        _meter = "shared scalp signal added to every channel - see the short 'fake' bump, and how NN1 regression (green) removes it from the long channels"
+
+    _note = mo.callout(
+        mo.md(
+            f"**{artifact.value}: 0 -> max.** Expect: {_expect}  \n"
+            f"**Effect strength:** {_meter}.  \n"
+            f"**Watch in the full app:** {_watch}."
+        ),
+        kind="warn",
+    )
+    mo.vstack([_note, _fig])
+    return
+
+
+@app.cell
 def _(mo, np, plt, sim):
     _note = mo.callout(
         mo.md(
