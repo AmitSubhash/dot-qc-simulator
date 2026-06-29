@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+
+# Environments
+.venv/
+venv/
+env/
+
+# marimo
+__marimo__/
+
+# tool caches
+.ruff_cache/
+.omx/
+
+# Exported notebooks / scratch
+*.html
+/private/
+
+# OS
+.DS_Store
+Thumbs.db
