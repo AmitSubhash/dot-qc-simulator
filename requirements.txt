@@ -1,0 +1,5 @@
+# DOT / fNIRS Signal Quality Simulator - runtime dependencies
+marimo>=0.23
+numpy>=1.26
+scipy>=1.11
+matplotlib>=3.8
