@@ -77,6 +77,17 @@ python3 -m marimo edit dot_qc_simulator.py
 
 All controls live in the left sidebar; the plots update reactively as you move a slider.
 
+## Validate the physics
+
+The spectroscopy is checked by a standalone script that parses the actual constants
+out of the app (extinction coefficients, DPF, cap geometry) and verifies the core
+invariants - Prahl extinction values + isosbestic ordering, a machine-precision MBLL
+forward/inverse round-trip, and the 26/31 cap with NN bands at 10/22/30/36 mm:
+
+```bash
+python3 tests/validate_physics.py     # or: pytest tests/
+```
+
 ## What to look for
 
 Each plot has a healthy "tell" and a warning "tell". A few experiments to build intuition:
